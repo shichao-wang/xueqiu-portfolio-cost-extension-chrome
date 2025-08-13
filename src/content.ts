@@ -34,6 +34,7 @@ export interface Rebalancing {
     updated_at: number;
     target_volume: number;
     prev_target_volume: number;
+    category?: string;
 }
 
 // 工具函数：判断买卖
@@ -49,15 +50,24 @@ async function fetchRebalanceHistory(zhNumber: string, count: number = 20): Prom
         page += 1;
         const response = await fetch(`https://xueqiu.com/cubes/rebalancing/history.json?cube_symbol=${zhNumber}&count=${count}&page=${page}`);
         const result = await response.json();
+        console.log('Fetched page:', page, 'Result:', result);
+
+        for (const item of result.list) {
+            const rebalancingHistories = Array.from(item.rebalancing_histories) as Rebalancing[];
+            histories = histories.concat(
+                rebalancingHistories.map((rebalanceing: Rebalancing) => {
+                    rebalanceing.category = item.category;
+                    return rebalanceing;
+                })
+            );
+        }
         if (result.page != page) {
             throw new Error(`Expected page ${page}, but got ${result.page}`);
         }
         if (result.maxPage == 0 || result.page == result.maxPage) {
             break; // No more pages to fetch
         }
-        for (const item of result.list) {
-            histories = histories.concat(item.rebalancing_histories as Rebalancing[]);
-        }
+
     }
     return histories;
 }
@@ -78,7 +88,7 @@ function getCurrentPositions(): Position[] {
         let symbol = '';
         let currentPrice = 0;
         if (priceDiv && priceDiv.textContent) {
-            const match = priceDiv.textContent.match(/^(\d+)\s+(\d+\.\d+)/);
+            const match = priceDiv.textContent.match(/^(\w+)\s+(\d+\.\d+)/);
             symbol = match?.[1] || '';
             currentPrice = parseFloat(match?.[2] || '0');
         }
@@ -95,14 +105,20 @@ function computeSymbolCost(histories: Rebalancing[], symbol: string): number {
     let totalCost = 0;
     let currentVolumn = 0;
     histories.reverse().forEach(item => {
-        if (getAction(item) === "buy") {
-            totalCost += item.price * item.volume;
+        if (item.category === 'sys_rebalancing') {
+            totalCost = item.net_value
+            currentVolumn = item.volume
+        } else if (getAction(item) === "buy") {
+            // totalCost += item.price * item.volume;
+            totalCost += item.net_value;
             currentVolumn += item.volume;
         } else {
-            totalCost -= item.price * item.volume;
+            // totalCost -= item.price * item.volume;
+            totalCost -= item.net_value;
             currentVolumn -= item.volume;
         }
-    })
+    });
+
     console.log('Symbol', symbol, 'Total cost:', totalCost, 'Current volume:', currentVolumn);
     return totalCost / currentVolumn;
 }
@@ -130,7 +146,10 @@ if (match) {
                 console.error('分页请求失败:', error);
                 return [] as Rebalancing[];
             });
+        console.log('Rebalance histories fetched:', rebalance_histories);
         const positions = getCurrentPositions();
+        console.log('Found positions:', positions);
+
         positions.forEach(position => {
             const symbolHistory = rebalance_histories
                 .filter(item => item.stock_symbol === position.symbol)
