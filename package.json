@@ -1,0 +1,27 @@
+{
+  "name": "my-chrome-extension",
+  "version": "1.0.0",
+  "description": "A Chrome extension built with TypeScript",
+  "main": "src/background.ts",
+  "scripts": {
+    "build": "webpack",
+    "watch": "webpack --watch",
+    "start": "open public/popup.html"
+  },
+  "keywords": [
+    "chrome",
+    "extension",
+    "typescript"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/chrome": "^0.1.3",
+    "clean-webpack-plugin": "^4.0.0",
+    "copy-webpack-plugin": "^13.0.1",
+    "ts-loader": "^8.4.0",
+    "typescript": "^4.0.0",
+    "webpack": "^5.101.1",
+    "webpack-cli": "^4.10.0"
+  }
+}
