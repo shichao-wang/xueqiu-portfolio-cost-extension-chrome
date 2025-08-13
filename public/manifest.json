@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "My Chrome Extension",
+  "name": "Xueqiu Portfolio Cost",
   "version": "1.0",
-  "description": "A simple Chrome extension built with TypeScript.",
+  "description": "Calculate and display the cost of your Xueqiu portfolio.",
   "permissions": [
     "activeTab",
     "scripting"

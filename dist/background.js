@@ -1,1 +1,0 @@
-(()=>{"use strict";chrome.runtime.onInstalled.addListener(()=>{console.log("Chrome extension installed")}),chrome.runtime.onMessage.addListener((e,t,a)=>{"getData"===e.action&&a({data:"Sample data"})}),chrome.tabs.onUpdated.addListener((e,t,a)=>{"complete"===t.status&&a.url&&console.log(`Tab updated: ${a.url}`)})})();
