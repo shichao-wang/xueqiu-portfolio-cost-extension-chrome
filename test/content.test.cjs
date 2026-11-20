@@ -64,8 +64,10 @@ async function renderPanel(pages, {
     stringPageNumbers = false,
     expectLoading = false,
     expectedRequests = pages.map((_, index) => index + 1),
+    expectedError,
     pageTotals,
     transientFailurePage,
+    htmlResponsePage,
     readyState = 'loading',
     href = 'https://xueqiu.com/P/ZH123',
 } = {}) {
@@ -99,10 +101,19 @@ async function renderPanel(pages, {
         location: new URL(href),
     };
     const requestedPages = [];
+    const errors = [];
+    let waitedSinceRequest = 0;
+    const setTestTimeout = (callback, delay) => {
+        queueMicrotask(() => {
+            waitedSinceRequest += delay;
+            callback();
+        });
+    };
     const fetchPage = async (url, { credentials }) => {
         const request = new URL(url);
         assert.equal(request.origin, 'https://www.xueqiu.com');
         assert.equal(request.pathname, '/cubes/rebalancing/history.json');
+        assert.equal(request.searchParams.get('count'), '50');
         assert.equal(request.searchParams.get('cube_symbol'), window.location.pathname.split('/')[2]);
         assert.equal(credentials, window.location.hostname === 'www.xueqiu.com' ? 'same-origin' : 'include');
         const page = Number(request.searchParams.get('page'));
@@ -112,13 +123,18 @@ async function renderPanel(pages, {
             assert.equal(table?.getAttribute('aria-busy'), 'true');
             assert.equal(table.children[1].children[0].children[2].textContent, '加载中');
         }
+        assert.equal(waitedSinceRequest, requestedPages.length ? 5000 : 0);
+        waitedSinceRequest = 0;
         requestedPages.push(page);
         if (page === transientFailurePage && requestedPages.indexOf(page) === requestedPages.length - 1) {
             return { ok: false, status: 503 };
         }
+        if (page === htmlResponsePage) {
+            return new Response('<html></html>', { headers: { 'Content-Type': 'text/html' } });
+        }
         const list = pages[page - 1];
         if (!list) return { ok: false, status: 503 };
-        return { ok: true, json: async () => ({
+        return { ok: true, headers: new Headers({ 'Content-Type': 'application/json' }), json: async () => ({
             list,
             page: stringPageNumbers ? String(page) : page,
             maxPage: stringPageNumbers ? String(pages.length) : pages.length,
@@ -137,11 +153,13 @@ async function renderPanel(pages, {
             tabs: { onUpdated: { addListener() {} } },
         },
         URL,
+        setTimeout: setTestTimeout,
         fetch: fetchPage,
     });
     runInNewContext(bundle, {
         window,
         URL,
+        setTimeout: setTestTimeout,
         Element: Object,
         MutationObserver: class {
             constructor(callback) { notifyMutation = callback; }
@@ -167,7 +185,7 @@ async function renderPanel(pages, {
             body,
             querySelectorAll: selector => pagePositions.filter(position => position.matches(selector)),
         },
-        console: { log() {}, error() {} },
+        console: { log() {}, error(...args) { errors.push(args.join(' ')); } },
         fetch: fetchPage,
     });
     if (expectLoading) assert.equal(requestedPages.length, 1);
@@ -178,6 +196,7 @@ async function renderPanel(pages, {
         notifyMutation([{ target: body, addedNodes: positions, removedNodes: [] }]);
     }
     assert.deepEqual(requestedPages, expectedRequests);
+    if (expectedError) assert.match(errors.join('\n'), expectedError);
     for (const [i, position] of positions.entries()) {
         assert.equal(position.querySelector('div .name').textContent, holdings[i].stock);
         assert.equal(position.querySelector('div .price')?.textContent ?? null, holdings[i].quote);
@@ -890,6 +909,26 @@ test('does not show a partial cost when a later history page fails', async () =>
         cost: '成本不可用',
         change: '—',
     });
+});
+
+test('loads the oldest opening across 1,131 records at 50 records per page', async () => {
+    const records = Array.from({ length: 1131 }, (_, index) => ({ id: 1131 - index, status: 'failed' }));
+    records[0] = { ...rebalance(1131, 100, 150, 20), id: 1131 };
+    records[1130] = { ...rebalance(1, 0, 100, 10), id: 1 };
+    const pages = [];
+    for (let index = 0; index < records.length; index += 50) pages.push(records.slice(index, index + 50));
+    assert.deepEqual(await displayCost(pages, { pageTotals: pages.map(() => 1131) }), costLabel('13.33', 50));
+});
+
+test('stops replay when the server returns HTML instead of history with HTTP 200', async () => {
+    const opening = rebalance(1, 0, 100, 10);
+    const result = await displayCost([[opening], [rebalance(2, 100, 150, 20)], [opening]], {
+        htmlResponsePage: 2,
+        expectedRequests: [1, 2],
+        expectedError: /第 2 页返回 text\/html/,
+    });
+    assert.equal(result.cost, '成本不可用');
+    assert.equal(result.change, '—');
 });
 
 test('recovers from one transient history page failure', async () => {
