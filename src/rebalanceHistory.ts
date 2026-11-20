@@ -1,5 +1,5 @@
 import { calculateHoldingCosts, quantitiesMatch, HoldingChange, UnitCost } from './portfolioCost';
-import { fetchHistoryPage, historyPageAction } from './historyPage';
+import { fetchHistoryPage, historyPageAction, waitBetweenHistoryRequests } from './historyPage';
 import { normalizeStockSymbol } from './stockSymbol';
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -100,6 +100,7 @@ export async function loadHoldingCosts(cubeSymbol: string): Promise<Map<string, 
     let expectedRecords: number | undefined;
     let recordCount = 0;
     for (let page = 1; ; page++) {
+        if (page > 1) await waitBetweenHistoryRequests();
         const result = await readHistoryPage(cubeSymbol, page);
         if (!isObject(result) || !Array.isArray(result.list) || pageNumber(result.page) !== page) {
             throw new Error(`无效的调仓历史分页（第 ${page} 页）`);
