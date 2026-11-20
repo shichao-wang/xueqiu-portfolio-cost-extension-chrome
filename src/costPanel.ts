@@ -1,4 +1,5 @@
 import type { UnitCost } from './portfolioCost';
+import type { HistoryProgress } from './rebalanceHistory';
 
 export interface HoldingQuote {
     symbol: string;
@@ -6,6 +7,11 @@ export interface HoldingQuote {
     currentPrice?: number;
     weight?: string;
 }
+
+export type CostPanelState =
+    | { kind: 'loading'; progress?: HistoryProgress }
+    | { kind: 'ready'; costs: ReadonlyMap<string, UnitCost> }
+    | { kind: 'failed' };
 
 export const panelId = 'xueqiu-portfolio-cost-panel';
 const returnFormat = new Intl.NumberFormat(undefined, {
@@ -92,6 +98,8 @@ export function createCostPanel() {
     const summary = document.createElement('summary');
     summary.textContent = '持仓成本';
 
+    const content = document.createElement('div');
+    content.className = 'panel-content';
     const scroll = document.createElement('div');
     scroll.className = 'scroll';
     const table = document.createElement('table');
@@ -101,22 +109,49 @@ export function createCostPanel() {
     const { head, renderRows } = createSortHeader(body, () => rows);
     table.append(head, body);
     scroll.append(table);
-    panel.append(summary, scroll);
+    const overlay = document.createElement('div');
+    overlay.className = 'loading';
+    const loadingLabel = document.createElement('span');
+    loadingLabel.setAttribute('role', 'status');
+    const progressBar = document.createElement('progress');
+    progressBar.setAttribute('aria-label', '调仓历史读取进度');
+    overlay.append(loadingLabel, progressBar);
+    const loadError = document.createElement('p');
+    loadError.className = 'load-error';
+    loadError.setAttribute('role', 'status');
+    loadError.textContent = '调仓历史加载失败，刷新页面可重试。';
+    content.append(scroll, overlay, loadError);
+    panel.append(summary, content);
     shadow.append(style, panel);
 
     let visiblePositions: readonly HoldingQuote[] = [];
-    let visibleCosts: ReadonlyMap<string, UnitCost> | undefined;
+    let state: CostPanelState = { kind: 'loading' };
     const renderHoldings = () => {
         if (!panel.open) return;
-        table.setAttribute('aria-busy', String(visibleCosts === undefined));
-        rows = visiblePositions.map(position => createCostRow(position, visibleCosts));
+        const loading = state.kind === 'loading';
+        table.setAttribute('aria-busy', String(loading));
+        scroll.inert = loading;
+        overlay.hidden = !loading;
+        loadError.hidden = state.kind !== 'failed';
+        if (state.kind === 'loading') {
+            if (state.progress) {
+                const { loadedPages, totalPages } = state.progress;
+                loadingLabel.textContent = `正在读取调仓历史 ${loadedPages} / ${totalPages} 页`;
+                progressBar.max = totalPages;
+                progressBar.value = loadedPages;
+            } else {
+                loadingLabel.textContent = '正在读取调仓历史';
+                progressBar.removeAttribute('value');
+            }
+        }
+        rows = visiblePositions.map(position => createCostRow(position, state));
         renderRows();
     };
     panel.addEventListener('toggle', renderHoldings);
 
-    return (positions: readonly HoldingQuote[], costs?: ReadonlyMap<string, UnitCost>): void => {
+    return (positions: readonly HoldingQuote[], nextState: CostPanelState): void => {
         visiblePositions = positions;
-        visibleCosts = costs;
+        state = nextState;
         if (!positions.length) {
             host.remove();
         } else if (!host.isConnected && !document.getElementById(panelId)) {
@@ -128,9 +163,9 @@ export function createCostPanel() {
 
 function createCostRow(
     { name, symbol, currentPrice, weight }: HoldingQuote,
-    costs?: ReadonlyMap<string, UnitCost>,
+    state: CostPanelState,
 ): CostTableRow {
-    const cost = costs?.get(symbol);
+    const cost = state.kind === 'ready' ? state.costs.get(symbol) : undefined;
     const change = cost && currentPrice !== undefined ? currentPrice / cost.price - 1 : undefined;
     const stockCell = document.createElement('th');
     stockCell.scope = 'row';
@@ -140,7 +175,7 @@ function createCostRow(
     const weightCell = document.createElement('td');
     weightCell.textContent = weight || '—';
     const costCell = document.createElement('td');
-    costCell.textContent = costs === undefined ? '加载中' : '成本不可用';
+    costCell.textContent = state.kind === 'loading' ? '加载中' : '成本不可用';
     if (cost) {
         const price = cost.price < 0.01 ? cost.price.toPrecision(2) : cost.price.toFixed(2);
         costCell.textContent = (cost.estimated ? '~' : '') + price;
@@ -210,6 +245,20 @@ const panelStyles = `
     details[open] summary::after { content: '−'; }
     summary:focus-visible { outline: 2px solid currentColor; outline-offset: -3px; }
 
+    .panel-content { position: relative; }
+    .panel-content:has(.loading:not([hidden])) { min-height: 112px; }
+    .loading:not([hidden]) {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        align-content: center;
+        justify-items: center;
+        gap: 10px;
+        text-align: center;
+        background: color-mix(in srgb, var(--surface) 92%, transparent);
+    }
+    progress { width: min(68%, 220px); height: 8px; accent-color: var(--text); }
+    .load-error { margin: 0; padding: 8px 12px; color: var(--muted); border-top: 1px solid var(--border); }
     .scroll { max-height: min(55vh, 420px); overflow: auto; }
     table { width: 100%; border-spacing: 0; font-variant-numeric: tabular-nums; }
     th, td { padding: 7px 12px; border-top: 1px solid var(--border); }

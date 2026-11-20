@@ -1,4 +1,18 @@
 import { fetchHistoryPage, historyPageAction } from './historyPage';
+import { checkHistoryAction, checkVerifiedHistory, saveHistoryAction, storeVerifiedHistory } from './historyCache';
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (sender.id !== chrome.runtime.id || sender.tab?.incognito ||
+        (request?.action !== saveHistoryAction && request?.action !== checkHistoryAction)) return;
+    const cubeSymbol = sender.url?.match(/^https:\/\/(?:www\.)?xueqiu\.com\/P\/(ZH\d+)(?:[/?#]|$)/)?.[1];
+    if (!cubeSymbol || cubeSymbol !== request.cubeSymbol) return;
+    if (request.action === checkHistoryAction) {
+        void checkVerifiedHistory(cubeSymbol, request.loadId).then(sendResponse);
+    } else {
+        void storeVerifiedHistory(cubeSymbol, request.history).then(() => sendResponse({}));
+    }
+    return true;
+});
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request?.action !== historyPageAction || sender.id !== chrome.runtime.id) return;

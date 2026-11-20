@@ -1,6 +1,5 @@
-import { createCostPanel, panelId, type HoldingQuote } from './costPanel';
+import { createCostPanel, panelId, type CostPanelState, type HoldingQuote } from './costPanel';
 import { loadHoldingCosts } from './rebalanceHistory';
-import type { UnitCost } from './portfolioCost';
 import { normalizeStockSymbol } from './stockSymbol';
 
 const holdingSelector = 'span.stock-name';
@@ -68,7 +67,7 @@ function affectsHoldings({ target, addedNodes, removedNodes, attributeName, oldV
 }
 
 async function displayHoldingCosts(cubeSymbol: string): Promise<void> {
-    let costs: Map<string, UnitCost> | undefined;
+    let state: CostPanelState = { kind: 'loading' };
     const updatePanel = createCostPanel();
     let lastPositions: string | undefined;
     const syncPositions = (force = false) => {
@@ -76,7 +75,7 @@ async function displayHoldingCosts(cubeSymbol: string): Promise<void> {
         const snapshot = JSON.stringify(positions);
         if (!force && snapshot === lastPositions && (!positions.length || document.getElementById(panelId))) return;
         lastPositions = snapshot;
-        updatePanel(positions, costs);
+        updatePanel(positions, state);
     };
     new MutationObserver(mutations => {
         if (mutations.some(affectsHoldings)) syncPositions();
@@ -90,10 +89,14 @@ async function displayHoldingCosts(cubeSymbol: string): Promise<void> {
     syncPositions();
 
     try {
-        costs = await loadHoldingCosts(cubeSymbol);
+        const costs = await loadHoldingCosts(cubeSymbol, progress => {
+            state = { kind: 'loading', progress };
+            syncPositions(true);
+        });
+        state = { kind: 'ready', costs };
     } catch (error) {
         console.error('无法读取组合调仓历史', error);
-        costs = new Map();
+        state = { kind: 'failed' };
     }
     syncPositions(true);
 }

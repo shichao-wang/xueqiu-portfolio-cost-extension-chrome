@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { randomUUID } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { test } = require('node:test');
@@ -68,6 +69,13 @@ async function renderPanel(pages, {
     pageTotals,
     transientFailurePage,
     htmlResponsePage,
+    historyCache,
+    beforeCacheWrite,
+    beforeCacheCheckResponse,
+    workerListeners = [],
+    now = Date.now(),
+    beforePage,
+    completeAfter,
     readyState = 'loading',
     href = 'https://xueqiu.com/P/ZH123',
 } = {}) {
@@ -117,15 +125,28 @@ async function renderPanel(pages, {
         assert.equal(request.searchParams.get('cube_symbol'), window.location.pathname.split('/')[2]);
         assert.equal(credentials, window.location.hostname === 'www.xueqiu.com' ? 'same-origin' : 'include');
         const page = Number(request.searchParams.get('page'));
-        if (expectLoading && page === 1) {
+        if (expectLoading) {
             const panel = body.children[0]?.shadowRoot.children.find(child => child.tagName === 'details');
-            const table = panel?.children[1].children[0];
+            const [scroll, overlay] = panel.children[1].children;
+            const table = scroll.children[0];
+            const [label, progress] = overlay.children;
             assert.equal(table?.getAttribute('aria-busy'), 'true');
             assert.equal(table.children[1].children[0].children[2].textContent, '加载中');
+            assert.equal(overlay.hidden, false);
+            assert.equal(scroll.inert, true);
+            if (page === 1) {
+                assert.equal(label.textContent, '正在读取调仓历史');
+                assert.equal(progress.getAttribute('value'), null);
+            } else {
+                assert.equal(label.textContent, `正在读取调仓历史 ${page - 1} / ${pages.length} 页`);
+                assert.equal(progress.max, pages.length);
+                assert.equal(progress.value, page - 1);
+            }
         }
-        assert.equal(waitedSinceRequest, requestedPages.length ? 4000 : 0);
+        assert.equal(waitedSinceRequest, requestedPages.length ? 3750 : 0);
         waitedSinceRequest = 0;
         requestedPages.push(page);
+        if (beforePage) await beforePage(page);
         if (page === transientFailurePage && requestedPages.indexOf(page) === requestedPages.length - 1) {
             return { ok: false, status: 503 };
         }
@@ -141,10 +162,20 @@ async function renderPanel(pages, {
             totalCount: pageTotals?.[page - 1],
         }) };
     };
-    const listeners = [];
+    const listeners = workerListeners;
     const sender = { url: href, id: 'test-extension' };
-    runInNewContext(background, {
+    const clock = class extends Date { static now() { return typeof now === 'function' ? now() : now; } };
+    const storage = historyCache && { local: {
+        get: async key => key === null ? Object.fromEntries(historyCache) : { [key]: historyCache.get(key) },
+        set: async values => {
+            if (beforeCacheWrite) await beforeCacheWrite(values);
+            for (const [key, value] of Object.entries(values)) historyCache.set(key, value);
+        },
+        remove: async keys => { for (const key of keys) historyCache.delete(key); },
+    } };
+    if (!listeners.length) runInNewContext(background, {
         chrome: {
+            storage,
             runtime: {
                 id: sender.id,
                 onInstalled: { addListener() {} },
@@ -159,6 +190,8 @@ async function renderPanel(pages, {
     runInNewContext(bundle, {
         window,
         URL,
+        crypto: { randomUUID },
+        Date: clock,
         setTimeout: setTestTimeout,
         Element: Object,
         MutationObserver: class {
@@ -169,10 +202,17 @@ async function renderPanel(pages, {
             }
         },
         chrome: {
+            storage,
             runtime: {
                 sendMessage: message => new Promise(resolve => {
+                    const receive = response => {
+                        if (message.action === 'checkVerifiedRebalanceHistory' && beforeCacheCheckResponse) {
+                            beforeCacheCheckResponse();
+                        }
+                        resolve(response);
+                    };
                     for (const listener of listeners) {
-                        if (listener(message, sender, resolve) === true) return;
+                        if (listener(message, sender, receive) === true) return;
                     }
                     resolve(undefined);
                 }),
@@ -189,6 +229,7 @@ async function renderPanel(pages, {
         fetch: fetchPage,
     });
     if (expectLoading) assert.equal(requestedPages.length, 1);
+    if (completeAfter) await completeAfter;
     await new Promise(setImmediate);
     if (renderHoldingsLate) {
         assert.equal(body.children.length, 0);
@@ -211,12 +252,16 @@ async function renderPanel(pages, {
     assert.equal(panel.open, true);
     assert.equal(panel.children[0].tagName, 'summary');
     assert.equal(panel.children[0].textContent, '持仓成本');
-    const table = panel.children[1].children[0];
+    const [scroll, overlay, loadError] = panel.children[1].children;
+    const table = scroll.children[0];
     const [head, rows] = table.children;
     return {
         headers: head.children[0].children,
         rows,
         panel,
+        scroll,
+        overlay,
+        loadError,
         updateQuote(index, newQuote) {
             positions[index].querySelector('div .price').textContent = newQuote;
             notifyMutation([{ target: positions[index], addedNodes: [], removedNodes: [] }]);
@@ -920,15 +965,420 @@ test('loads the oldest opening across 1,131 records at 50 records per page', asy
     assert.deepEqual(await displayCost(pages, { pageTotals: pages.map(() => 1131) }), costLabel('13.33', 50));
 });
 
+function historyWithCachedOpening() {
+    const history = Array.from({ length: 53 }, (_, index) => ({ id: 53 - index, status: 'failed' }));
+    history[0] = { ...rebalance(53, 100, 150, 20), id: 53 };
+    history[52] = { ...rebalance(1, 0, 100, 10), id: 1 };
+    return history;
+}
+
+function paginateHistory(history, options) {
+    const pages = [];
+    for (let index = 0; index < history.length; index += 50) pages.push(history.slice(index, index + 50));
+    return displayCost(pages, { pageTotals: pages.map(() => history.length), ...options });
+}
+
+test('reopens an unchanged history after verifying only its latest page', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    assert.deepEqual(await paginateHistory(history, { historyCache }), costLabel('13.33', 50));
+    assert.deepEqual(await paginateHistory(history, { historyCache, expectedRequests: [1] }), costLabel('13.33', 50));
+});
+
+test('shares one verified history between the two Xueqiu hostnames', async () => {
+    const historyCache = new Map();
+    const { history, revised, newer } = revisedTradeAtCacheBoundary();
+    const www = 'https://www.xueqiu.com/P/ZH123';
+    await paginateHistory(history, { historyCache, now: 1 });
+    await paginateHistory(revised, { historyCache, now: 2, href: www });
+    assert.deepEqual(await paginateHistory(newer, { historyCache, now: 3, expectedRequests: [1] }), costLabel('20.00', 0));
+});
+
+test('fetches new records across pages and reuses the verified older tail', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    await paginateHistory(history, { historyCache, now: 1 });
+    const newRecords = Array.from({ length: 60 }, (_, index) => ({ id: 113 - index, status: 'failed' }));
+    newRecords[0] = { ...rebalance(113, 150, 200, 40), id: 113 };
+    const updated = newRecords.concat(history);
+    assert.deepEqual(await paginateHistory(updated, { historyCache, now: 2, expectedRequests: [1, 2] }), costLabel('20.00', 0));
+    assert.deepEqual(await paginateHistory(updated, { historyCache, now: 3, expectedRequests: [1] }), costLabel('20.00', 0));
+});
+
+test('loads the entire history again when an overlapping trade was revised', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    await paginateHistory(history, { historyCache });
+    history[0].rebalancing_histories[0].price = 30;
+    assert.deepEqual(await paginateHistory(history, { historyCache }), costLabel('16.67', 20));
+});
+
+test('refreshes instead of guessing which concurrent scan saw the latest older trades', async () => {
+    const historyCache = new Map();
+    const workerListeners = [];
+    const href = 'https://www.xueqiu.com/P/ZH123';
+    const original = historyWithCachedOpening();
+    const corrected = structuredClone(original);
+    corrected.at(-1).rebalancing_histories[0].price = 15;
+    let notifyPageRequested;
+    let releasePage;
+    const pageRequested = new Promise(resolve => { notifyPageRequested = resolve; });
+    const pageResponse = new Promise(resolve => { releasePage = resolve; });
+    let timestamp = 1;
+    const now = () => timestamp;
+    const earlier = paginateHistory(original, { historyCache, workerListeners, href, now, completeAfter: pageResponse, beforePage: page => {
+        if (page !== 2) return;
+        notifyPageRequested();
+        return pageResponse;
+    } });
+    await pageRequested;
+    timestamp++;
+    try {
+        assert.deepEqual(await paginateHistory(corrected, { historyCache, workerListeners, href, now }), costLabel('16.67', 20));
+    } finally {
+        releasePage();
+    }
+    await earlier;
+    await new Promise(setImmediate);
+    timestamp++;
+    assert.deepEqual(await paginateHistory(corrected, { historyCache, workerListeners, href, now }), costLabel('16.67', 20));
+    assert.deepEqual(await paginateHistory(corrected, { historyCache, workerListeners, href, now, expectedRequests: [1] }), costLabel('16.67', 20));
+});
+
+test('withholds costs when page metadata cannot account for all remaining pages', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    await paginateHistory(history, { historyCache });
+    const pages = [history.slice(0, 50), ...Array.from({ length: 4 }, () => [])];
+    const result = await displayCost(pages, { historyCache, pageTotals: [53], expectedRequests: [1] });
+    assert.equal(result.cost, '成本不可用');
+});
+
+test('reclaims expired histories if storage has no room for a new complete snapshot', async () => {
+    const historyCache = new Map();
+    historyCache.set = function setWithinQuota(key, value) {
+        if (this.size && !this.has(key)) throw new Error('QUOTA_BYTES');
+        return Map.prototype.set.call(this, key, value);
+    };
+    const history = historyWithCachedOpening();
+    await paginateHistory(history, { historyCache, now: 1, href: 'https://www.xueqiu.com/P/ZH123' });
+    const href = 'https://xueqiu.com/P/ZH456';
+    const now = 30 * 24 * 60 * 60 * 1000 + 1;
+    await paginateHistory(history, { historyCache, now, href });
+    assert.deepEqual(await paginateHistory(history, { historyCache, now, href, expectedRequests: [1] }), costLabel('13.33', 50));
+});
+
+test('keeps the same duplicate-revision decision for live and cached history', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    history[0] = { ...rebalance(1, 0, 100, 10), id: 53 };
+    const undatedCopy = { ...rebalance(1, 0, 100, 10), id: 1, prev_bebalancing_id: true };
+    delete undatedCopy.rebalancing_histories[0].created_at;
+    delete undatedCopy.rebalancing_histories[0].updated_at;
+    history[52] = undatedCopy;
+    assert.equal((await paginateHistory(history, { historyCache })).cost, '成本不可用');
+    assert.equal((await paginateHistory(history, { historyCache, expectedRequests: [1] })).cost, '成本不可用');
+});
+
+test('fetches corrected older copies when a recent trade detail conflicts with the cached tail', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    history[0] = { id: 53, status: 'failed' };
+    await paginateHistory(history, { historyCache, now: 1 });
+    history[52].rebalancing_histories[0].price = 20;
+    history.unshift({ ...rebalance(1, 0, 100, 20), id: 54 });
+    assert.deepEqual(await paginateHistory(history, { historyCache, now: 2 }), costLabel('20.00', 0));
+});
+
+test('distinguishes an unspecified prior quantity from an explicit opening across cached copies', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    history[0] = { id: 53, status: 'failed' };
+    delete history[52].rebalancing_histories[0].prev_volume;
+    await paginateHistory(history, { historyCache, now: 1 });
+    history[52].rebalancing_histories[0].prev_volume = null;
+    history.unshift({ ...rebalance(1, null, 100, 10), id: 54 });
+    assert.deepEqual(await paginateHistory(history, { historyCache, now: 2 }), costLabel('10.00', 100));
+});
+
+test('stops at a malformed history page before waiting for the next page', async () => {
+    const history = historyWithCachedOpening();
+    delete history[0].rebalancing_histories;
+    assert.equal((await paginateHistory(history, { expectedRequests: [1] })).cost, '成本不可用');
+});
+
+test('reads older pages when a cached pending trade may have settled', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    history[52].status = 'pending';
+    assert.equal((await paginateHistory(history, { historyCache })).cost, '成本不可用');
+    history[52].status = 'success';
+    assert.deepEqual(await paginateHistory(history, { historyCache }), costLabel('13.33', 50));
+});
+
+test('shows verified costs even when local storage cannot save the history', async () => {
+    const historyCache = new Map();
+    historyCache.set = () => { throw new Error('QUOTA_BYTES'); };
+    assert.deepEqual(await paginateHistory(historyWithCachedOpening(), { historyCache }), costLabel('13.33', 50));
+});
+
+test('revalidates older records after 30 days even after a recent incremental update', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+    await paginateHistory(history, { historyCache, now: 1 });
+    history.unshift({ ...rebalance(54, 150, 200, 40), id: 54 });
+    await paginateHistory(history, { historyCache, now: thirtyDays, expectedRequests: [1] });
+    history.at(-1).rebalancing_histories[0].price = 20;
+    assert.deepEqual(await paginateHistory(history, { historyCache, now: thirtyDays + 1 }), costLabel('25.00', -20));
+});
+
+test('rechecks the cache expiry after waiting for the worker to confirm the cache hit', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    await paginateHistory(history, { historyCache, now: 1 });
+    history.at(-1).rebalancing_histories[0].price = 15;
+    let timestamp = 30 * 24 * 60 * 60 * 1000;
+    assert.deepEqual(await paginateHistory(history, { historyCache, now: () => timestamp,
+        beforeCacheCheckResponse: () => { timestamp++; },
+    }), costLabel('16.67', 20));
+});
+
+test('keeps the last complete cache after a failed refresh and withholds stale costs', async () => {
+    const historyCache = new Map();
+    const history = historyWithCachedOpening();
+    await paginateHistory(history, { historyCache });
+    const completeCache = [...historyCache];
+    const result = await paginateHistory(history, { historyCache, htmlResponsePage: 1, expectedRequests: [1] });
+    assert.equal(result.cost, '成本不可用');
+    assert.deepEqual([...historyCache], completeCache);
+});
+
+function revisedTradeAtCacheBoundary() {
+    const history = historyWithCachedOpening();
+    history[0] = { ...rebalance(53, 200, 250, 20), id: 53 };
+    history[49] = { ...rebalance(4, 100, 200, 10), id: 4 };
+    const revised = structuredClone(history);
+    revised[49].rebalancing_histories[0].price = 30;
+    const added = Array.from({ length: 49 }, (_, i) => ({ id: 102 - i, status: 'failed' }));
+    return { history, revised, newer: added.concat(revised) };
+}
+
+test('never reuses a revised tail after the replacement history fails to load', async () => {
+    const { history, revised, newer } = revisedTradeAtCacheBoundary();
+    const malformed = structuredClone(revised);
+    malformed[48].status = 'success';
+    for (const [records, options] of [
+        [revised, { htmlResponsePage: 2 }],
+        [malformed, { expectedRequests: [1] }],
+    ]) {
+        const historyCache = new Map();
+        assert.deepEqual(await paginateHistory(history, { historyCache, now: 1 }), costLabel('12.00', 66.67));
+        assert.equal((await paginateHistory(records, { historyCache, now: 2, ...options })).cost, '成本不可用');
+        assert.deepEqual(await paginateHistory(newer, { historyCache, now: 3 }), costLabel('20.00', 0));
+    }
+});
+
+test('discards the cache if the final page cannot account for every record', async () => {
+    const historyCache = new Map();
+    const history = Array.from({ length: 40 }, (_, i) => ({ id: 40 - i, status: 'failed' }));
+    history[39] = { ...rebalance(1, 0, 100, 10), id: 1 };
+    await paginateHistory(history, { historyCache, now: 1 });
+    history[39].rebalancing_histories[0].price = 20;
+    const added = Array.from({ length: 50 }, (_, i) => ({ id: 90 - i, status: 'failed' }));
+    const incomplete = await displayCost([added, history.slice(1)], { historyCache, now: 2, pageTotals: [90, 90] });
+    assert.equal(incomplete.cost, '成本不可用');
+    assert.deepEqual(await paginateHistory(added.slice(1).concat(history), { historyCache, now: 3 }), costLabel('20.00', 0));
+});
+
+test('does not reuse stale history after a full refresh without a record count', async () => {
+    const historyCache = new Map();
+    const { history, revised, newer } = revisedTradeAtCacheBoundary();
+    await paginateHistory(history, { historyCache, now: 1 });
+    assert.deepEqual(await paginateHistory(revised, { historyCache, now: 2, pageTotals: undefined }), costLabel('20.00', 0));
+    assert.deepEqual(await paginateHistory(newer, { historyCache, now: 3 }), costLabel('20.00', 0));
+});
+
+test('prevents an older cold scan from caching data after a newer uncounted scan', async () => {
+    const { history, revised } = revisedTradeAtCacheBoundary();
+    const shared = { historyCache: new Map(), workerListeners: [], href: 'https://www.xueqiu.com/P/ZH123' };
+    let notifyTail;
+    let releaseTail;
+    const tailStarted = new Promise(resolve => { notifyTail = resolve; });
+    const tailResponse = new Promise(resolve => { releaseTail = resolve; });
+    let timestamp = 1;
+    const older = paginateHistory(history, { ...shared, now: () => timestamp, completeAfter: tailResponse,
+        beforePage: page => {
+            if (page === 2) {
+                notifyTail();
+                return tailResponse;
+            }
+        },
+    });
+    await tailStarted;
+    try {
+        assert.deepEqual(await paginateHistory(revised, { ...shared, now: 2, pageTotals: undefined }), costLabel('20.00', 0));
+    } finally {
+        timestamp = 3;
+        releaseTail();
+    }
+    await older;
+    assert.deepEqual(await paginateHistory(revised, { ...shared, now: 4 }), costLabel('20.00', 0));
+});
+
+test('invalidates a cache written while the first request of a failed scan was pending', async () => {
+    const { history, revised, newer } = revisedTradeAtCacheBoundary();
+    const shared = { historyCache: new Map(), workerListeners: [], href: 'https://www.xueqiu.com/P/ZH123' };
+    let notifyHead;
+    let releaseHead;
+    const headStarted = new Promise(resolve => { notifyHead = resolve; });
+    const headResponse = new Promise(resolve => { releaseHead = resolve; });
+    let timestamp = 1;
+    const pending = paginateHistory(revised, { ...shared, htmlResponsePage: 2, now: () => timestamp,
+        completeAfter: headResponse, beforePage: page => {
+            if (page === 1) {
+                notifyHead();
+                return headResponse;
+            }
+        },
+    });
+    await headStarted;
+    try {
+        await paginateHistory(history, { ...shared, now: 2 });
+    } finally {
+        timestamp = 3;
+        releaseHead();
+    }
+    assert.equal((await pending).cost, '成本不可用');
+    assert.deepEqual(await paginateHistory(newer, { ...shared, now: 4 }), costLabel('20.00', 0));
+});
+
+test('invalidates a newer cached scan if a delayed page shows a further revision', async () => {
+    const { history, revised, newer } = revisedTradeAtCacheBoundary();
+    const furtherRevision = structuredClone(revised);
+    furtherRevision[49].rebalancing_histories[0].price = 40;
+    const shared = { historyCache: new Map(), workerListeners: [], href: 'https://www.xueqiu.com/P/ZH123' };
+    await paginateHistory(history, { ...shared, now: 1 });
+    let notifyStarted;
+    let release;
+    const started = new Promise(resolve => { notifyStarted = resolve; });
+    const pageResponse = new Promise(resolve => { release = resolve; });
+    let timestamp = 2;
+    const pending = paginateHistory(furtherRevision, { ...shared, now: () => timestamp, htmlResponsePage: 2,
+        completeAfter: pageResponse, beforePage: page => {
+            if (page === 1) {
+                notifyStarted();
+                return pageResponse;
+            }
+        },
+    });
+    await started;
+    try {
+        assert.deepEqual(await paginateHistory(revised, { ...shared, now: 3 }), costLabel('20.00', 0));
+    } finally {
+        timestamp = 4;
+        release();
+    }
+    assert.equal((await pending).cost, '成本不可用');
+    assert.deepEqual(await paginateHistory(newer.slice(0, 49).concat(furtherRevision), { ...shared, now: 5 }),
+        costLabel('24.00', -16.67));
+});
+
+test('checks an in-flight cache hit after queued invalidations finish writing', async () => {
+    const { history, revised, newer } = revisedTradeAtCacheBoundary();
+    let notifyWrite;
+    let finishWrite;
+    const writeStarted = new Promise(resolve => { notifyWrite = resolve; });
+    const invalidationWrite = new Promise(resolve => { finishWrite = resolve; });
+    const shared = { historyCache: new Map(), workerListeners: [], href: 'https://www.xueqiu.com/P/ZH123',
+        beforeCacheWrite: values => {
+            if (Object.values(values).some(value => 'invalidatedAt' in JSON.parse(value))) {
+                notifyWrite();
+                return invalidationWrite;
+            }
+        },
+    };
+    await paginateHistory(history, { ...shared, now: 1 });
+    let notifyStarted;
+    let release;
+    const started = new Promise(resolve => { notifyStarted = resolve; });
+    const pageResponse = new Promise(resolve => { release = resolve; });
+    const otherTab = paginateHistory(newer, { ...shared, now: 2, beforePage: page => {
+        if (page === 1) {
+            notifyStarted();
+            return pageResponse;
+        }
+    }, completeAfter: Promise.all([pageResponse, invalidationWrite]) });
+    await started;
+    const failed = paginateHistory(revised, {
+        ...shared, now: 3, htmlResponsePage: 2, completeAfter: invalidationWrite,
+    });
+    await writeStarted;
+    release();
+    await new Promise(setImmediate);
+    finishWrite();
+    assert.equal((await failed).cost, '成本不可用');
+    assert.deepEqual(await otherTab, costLabel('20.00', 0));
+});
+
+test('requires a fresh scan when two tabs both invalidate the same cache', async () => {
+    const { history, revised } = revisedTradeAtCacheBoundary();
+    const conflicting = structuredClone(revised);
+    conflicting[52].rebalancing_histories[0].price = 20;
+    const shared = { historyCache: new Map(), workerListeners: [], href: 'https://www.xueqiu.com/P/ZH123' };
+    await paginateHistory(history, { ...shared, now: 1 });
+    let releaseHead;
+    let releaseTail;
+    let notifyBothHeads;
+    let notifyBothTails;
+    const headsWaiting = new Promise(resolve => { notifyBothHeads = resolve; });
+    const tailsWaiting = new Promise(resolve => { notifyBothTails = resolve; });
+    const heads = new Promise(resolve => { releaseHead = resolve; });
+    const tails = new Promise(resolve => { releaseTail = resolve; });
+    let headCount = 0;
+    let tailCount = 0;
+    const beforePage = page => {
+        if (page === 1) {
+            if (++headCount === 2) notifyBothHeads();
+            return heads;
+        }
+        if (++tailCount === 2) notifyBothTails();
+        return tails;
+    };
+    const first = paginateHistory(revised, { ...shared, now: 2, beforePage, completeAfter: tails });
+    const second = paginateHistory(conflicting, { ...shared, now: 3, beforePage, completeAfter: tails });
+    await headsWaiting;
+    releaseHead();
+    await tailsWaiting;
+    releaseTail();
+    await Promise.all([first, second]);
+    assert.deepEqual(await paginateHistory(conflicting, { ...shared, now: 4 }), costLabel('24.00', -16.67));
+});
+
+test('covers the holdings with progress until all history pages have loaded', async () => {
+    const { rows, scroll, overlay, loadError } = await renderPanel([
+        [rebalance(2, 100, 150, 20)],
+        [rebalance(1, 0, 100, 10)],
+    ], { expectLoading: true });
+    assert.equal(overlay.hidden, true);
+    assert.equal(scroll.inert, false);
+    assert.equal(scroll.children[0].getAttribute('aria-busy'), 'false');
+    assert.equal(loadError.hidden, true);
+    assert.equal(rows.children[0].children[2].textContent, '13.33');
+});
+
 test('stops replay when the server returns HTML instead of history with HTTP 200', async () => {
     const opening = rebalance(1, 0, 100, 10);
-    const result = await displayCost([[opening], [rebalance(2, 100, 150, 20)], [opening]], {
+    const { rows, overlay, loadError } = await renderPanel([[opening], [rebalance(2, 100, 150, 20)], [opening]], {
         htmlResponsePage: 2,
         expectedRequests: [1, 2],
         expectedError: /第 2 页返回 text\/html/,
+        expectLoading: true,
     });
-    assert.equal(result.cost, '成本不可用');
-    assert.equal(result.change, '—');
+    assert.equal(overlay.hidden, true);
+    assert.equal(loadError.hidden, false);
+    assert.equal(rows.children[0].children[2].textContent, '成本不可用');
+    assert.equal(rows.children[0].children[3].textContent, '—');
 });
 
 test('recovers from one transient history page failure', async () => {
