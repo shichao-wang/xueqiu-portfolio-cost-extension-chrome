@@ -5,6 +5,7 @@
   "main": "src/background.ts",
   "scripts": {
     "build": "webpack",
+    "test": "npm run build && node --test",
     "watch": "webpack --watch",
     "start": "open public/popup.html"
   },
