@@ -1,6 +1,6 @@
 export const historyPageAction = 'getRebalanceHistoryPage';
 const historyPageSize = 50;
-const historyRequestIntervalMs = 5000;
+const historyRequestIntervalMs = 4000;
 
 export function waitBetweenHistoryRequests(): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, historyRequestIntervalMs));

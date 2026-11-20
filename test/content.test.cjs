@@ -123,7 +123,7 @@ async function renderPanel(pages, {
             assert.equal(table?.getAttribute('aria-busy'), 'true');
             assert.equal(table.children[1].children[0].children[2].textContent, '加载中');
         }
-        assert.equal(waitedSinceRequest, requestedPages.length ? 5000 : 0);
+        assert.equal(waitedSinceRequest, requestedPages.length ? 4000 : 0);
         waitedSinceRequest = 0;
         requestedPages.push(page);
         if (page === transientFailurePage && requestedPages.indexOf(page) === requestedPages.length - 1) {
