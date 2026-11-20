@@ -1,171 +1,105 @@
-function showTooltips(content: string) {
-    const element = document.createElement('div');
-    element.textContent = `Hello from your Chrome extension! ${content}`;
-    element.style.position = 'fixed';
-    element.style.bottom = '10px';
-    element.style.right = '10px';
-    element.style.backgroundColor = 'white';
-    element.style.border = '1px solid black';
-    element.style.padding = '10px';
-    element.style.zIndex = '1000';
+import { createCostPanel, panelId, type HoldingQuote } from './costPanel';
+import { loadHoldingCosts } from './rebalanceHistory';
+import type { UnitCost } from './portfolioCost';
+import { normalizeStockSymbol } from './stockSymbol';
 
-    document.body.appendChild(element);
+const holdingSelector = 'span.stock-name';
+const quotePricePattern = /^(?:(?:HK|US)?\$|[¥￥])?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(?=[\s(（+−-]|港元|美元|元|$)/;
+const quotePriceSuffix = /^\s*(?:港元|美元|元)?(?:\s*(?:[(（][^）)]*[)）]|[+−-]\d+(?:\.\d+)?[%％]?))*\s*$/;
+
+function matchQuotePrice(text: string): RegExpMatchArray | null {
+    const match = text.match(quotePricePattern);
+    return match && quotePriceSuffix.test(text.slice(match[0].length)) ? match : null;
 }
 
-export interface Rebalancing {
-    id: number;
-    rebalancing_id: number;
-    stock_id: number;
-    stock_name: string;
-    stock_symbol: string;
-    volume: number;
-    price: number;
-    net_value: number;
-    weight: number;
-    target_weight: number;
-    prev_weight: number;
-    prev_target_weight: number;
-    prev_weight_adjusted: number;
-    prev_volume: number;
-    prev_price: number;
-    prev_net_value: number;
-    proactive: boolean;
-    created_at: number;
-    updated_at: number;
-    target_volume: number;
-    prev_target_volume: number;
-    category?: string;
-}
-
-// 工具函数：判断买卖
-function getAction(rebalancing: Rebalancing): "buy" | "sell" {
-    return rebalancing.prev_weight_adjusted > rebalancing.target_weight ? "sell" : "buy";
-}
-
-async function fetchRebalanceHistory(zhNumber: string, count: number = 20): Promise<Rebalancing[]> {
-    let histories: Rebalancing[] = [];
-
-    let page = 0;
-    while (true) {
-        page += 1;
-        const response = await fetch(`https://xueqiu.com/cubes/rebalancing/history.json?cube_symbol=${zhNumber}&count=${count}&page=${page}`);
-        const result = await response.json();
-        console.log('Fetched page:', page, 'Result:', result);
-
-        for (const item of result.list) {
-            const rebalancingHistories = Array.from(item.rebalancing_histories) as Rebalancing[];
-            histories = histories.concat(
-                rebalancingHistories.map((rebalanceing: Rebalancing) => {
-                    rebalanceing.category = item.category;
-                    return rebalanceing;
-                })
-            );
-        }
-        if (result.page != page) {
-            throw new Error(`Expected page ${page}, but got ${result.page}`);
-        }
-        if (result.maxPage == 0 || result.page == result.maxPage) {
-            break; // No more pages to fetch
-        }
-
+function readCurrentPrice(quote: string | undefined, symbol: string): number | undefined {
+    if (!quote) return undefined;
+    let match = matchQuotePrice(quote);
+    const suffix = quote.slice(match?.[0].length ?? 0).trim();
+    const ambiguousTicker = match !== null && /^\d+$/.test(match[0]) &&
+        (/^0\d{4}$/.test(match[0]) || /^\d{5}$/.test(symbol));
+    const hasPriceNotation = match !== null && (!ambiguousTicker || /^(?:港元|美元|元)/.test(suffix));
+    if (!hasPriceNotation) {
+        const ticker = quote.match(/^\S+/)?.[0];
+        if (!ticker || normalizeStockSymbol(ticker) !== symbol) return undefined;
+        match = matchQuotePrice(quote.slice(ticker.length).trim());
     }
-    return histories;
+    if (!match) return undefined;
+    const amount = Number(match[1].replace(/,/g, ''));
+    return Number.isFinite(amount) && amount > 0 ? amount : undefined;
 }
 
-export interface Position {
-    symbol: string;
-    name: string;
-    currentPrice: number;
-    element: HTMLElement;
+function readQuoteTicker(quote: string | undefined): string | undefined {
+    const match = quote?.match(/^([A-Z_][A-Z\d_]*(?:[.-][A-Z\d_]+)*|0\d{4})\s+([\s\S]+)$/i);
+    if (!match) return undefined;
+    const remaining = match[2];
+    return matchQuotePrice(remaining) || /^(?:--|—)$/.test(remaining) ? match[1] : undefined;
 }
 
-function getCurrentPositions(): Position[] {
-    const positions = document.querySelectorAll('span.stock-name');
-    return Array.from(positions).map(item => {
-        const name = (item.querySelector('div .name') as HTMLElement | null)?.textContent || '';
-        const priceDiv = item.querySelector('div .price') as HTMLElement | null;
+function getCurrentPositions(): HoldingQuote[] {
+    const positions: HoldingQuote[] = [];
+    for (const element of Array.from(document.querySelectorAll<HTMLElement>(holdingSelector))) {
+        const stock = element.closest('.stock');
+        const name = element.querySelector('div .name')?.textContent?.trim();
+        const quote = element.querySelector('div .price')?.textContent?.trim();
+        const rawSymbol = stock?.getAttribute('href')?.match(/^(?:https:\/\/(?:www\.)?xueqiu\.com)?\/S\/([^/?#]+)/)?.[1] ||
+            element.getAttribute('data-symbol') || stock?.getAttribute('data-symbol') ||
+            readQuoteTicker(quote);
+        if (!name || !rawSymbol) continue;
 
-        let symbol = '';
-        let currentPrice = 0;
-        if (priceDiv && priceDiv.textContent) {
-            const match = priceDiv.textContent.match(/^(\w+)\s+(\d+\.\d+)/);
-            symbol = match?.[1] || '';
-            currentPrice = parseFloat(match?.[2] || '0');
-        }
-        return {
-            symbol,
-            name,
-            currentPrice,
-            element: item as HTMLElement
-        } as Position;
-    }).filter(item => item.symbol && item.name);
-}
-
-function computeSymbolCost(histories: Rebalancing[], symbol: string): number {
-    let totalCost = 0;
-    let currentVolumn = 0;
-    histories.reverse().forEach(item => {
-        if (item.category === 'sys_rebalancing') {
-            totalCost = item.net_value
-            currentVolumn = item.volume
-        } else if (getAction(item) === "buy") {
-            // totalCost += item.price * item.volume;
-            totalCost += item.net_value;
-            currentVolumn += item.volume;
-        } else {
-            // totalCost -= item.price * item.volume;
-            totalCost -= item.net_value;
-            currentVolumn -= item.volume;
-        }
-    });
-
-    console.log('Symbol', symbol, 'Total cost:', totalCost, 'Current volume:', currentVolumn);
-    return totalCost / currentVolumn;
-}
-
-const match = window.location.href.match(/^https:\/\/xueqiu\.com\/P\/(ZH\d+)/);
-console.log('Content script loaded');
-
-if (match) {
-    console.log('Matched URL:', window.location.href);
-    const zhNumber = match[1];
-    showTooltips(zhNumber);
-
-    if ((window as any).__xueqiu_plugin_loaded__) {
-        // 已经执行过，直接返回
-        // @ts-ignore
-        return;
+        const symbol = normalizeStockSymbol(rawSymbol);
+        const currentPrice = readCurrentPrice(quote, symbol);
+        const weight = stock?.querySelector('.stock-weight')?.textContent?.trim();
+        positions.push({ symbol, currentPrice, name, weight });
     }
-    // @ts-ignore
-    (window as any).__xueqiu_plugin_loaded__ = true;
+    return positions;
+}
 
-    window.onload = async () => {
-        console.log('Window loaded');
-        let rebalance_histories = await fetchRebalanceHistory(zhNumber)
-            .catch(error => {
-                console.error('分页请求失败:', error);
-                return [] as Rebalancing[];
-            });
-        console.log('Rebalance histories fetched:', rebalance_histories);
+function affectsHoldings({ target, addedNodes, removedNodes, attributeName, oldValue }: MutationRecord): boolean {
+    if (Array.from(removedNodes).some(node => node instanceof Element && node.id === panelId)) return true;
+    const element = target instanceof Element ? target : target.parentElement;
+    if (element?.closest('.stock, ' + holdingSelector)) return true;
+    if (attributeName === 'class' && oldValue?.split(/\s+/).some(name => name === 'stock' || name === 'stock-name')) {
+        return true;
+    }
+    return [...Array.from(addedNodes), ...Array.from(removedNodes)].some(node =>
+        node instanceof Element && (node.matches(holdingSelector) || node.querySelector(holdingSelector) !== null)
+    );
+}
+
+async function displayHoldingCosts(cubeSymbol: string): Promise<void> {
+    let costs: Map<string, UnitCost> | undefined;
+    const updatePanel = createCostPanel();
+    let lastPositions: string | undefined;
+    const syncPositions = (force = false) => {
         const positions = getCurrentPositions();
-        console.log('Found positions:', positions);
+        const snapshot = JSON.stringify(positions);
+        if (!force && snapshot === lastPositions && (!positions.length || document.getElementById(panelId))) return;
+        lastPositions = snapshot;
+        updatePanel(positions, costs);
+    };
+    new MutationObserver(mutations => {
+        if (mutations.some(affectsHoldings)) syncPositions();
+    }).observe(document.body, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+        attributeFilter: ['href', 'data-symbol', 'class'],
+        attributeOldValue: true,
+    });
+    syncPositions();
 
-        positions.forEach(position => {
-            const symbolHistory = rebalance_histories
-                .filter(item => item.stock_symbol === position.symbol)
-                .sort((a, b) => b.updated_at - a.updated_at);
-            console.log('Symbol history for', position.symbol, symbolHistory);
-            const symbolCost = computeSymbolCost(symbolHistory, position.symbol);
-            const positionFloating = ((position.currentPrice - symbolCost) * 100 / symbolCost)
-                .toLocaleString(undefined, { signDisplay: 'always', maximumFractionDigits: 2, minimumFractionDigits: 2 });
-            position.element.querySelector('div .name')!.textContent += ` ${symbolCost.toFixed(2)}(${positionFloating}%)`;
-            // position.element.textContent += ` (成本: ${symbolCost.toFixed(2)})`;
-            if (symbolCost > position.currentPrice) {
-                position.element.style.color = 'green';
-            } else {
-                position.element.style.color = 'red';
-            }
-        });
+    try {
+        costs = await loadHoldingCosts(cubeSymbol);
+    } catch (error) {
+        console.error('无法读取组合调仓历史', error);
+        costs = new Map();
     }
+    syncPositions(true);
+}
 
+const cubeSymbol = window.location.href.match(/^https:\/\/(?:www\.)?xueqiu\.com\/P\/(ZH\d+)/)?.[1];
+if (cubeSymbol) {
+    // The manifest injects at document_idle, when the DOM is available.
+    void displayHoldingCosts(cubeSymbol);
 }

@@ -7,12 +7,13 @@
     "activeTab",
     "scripting"
   ],
+  "host_permissions": ["https://www.xueqiu.com/*"],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://xueqiu.com/P/ZH*"],
+      "matches": ["https://xueqiu.com/P/ZH*", "https://www.xueqiu.com/P/ZH*"],
       "js": ["content.js"]
     }
   ],
